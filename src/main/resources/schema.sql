@@ -1,0 +1,4 @@
+-- Create fulltext index for search (MySQL will ignore if already exists with IF NOT EXISTS on table)
+-- This runs after JPA creates the table via ddl-auto=update
+-- Execute manually if needed:
+-- ALTER TABLE documents ADD FULLTEXT INDEX ft_title_content (title, content);
