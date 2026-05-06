@@ -3,10 +3,11 @@ package com.distributed_document.document_search_service.service;
 import com.distributed_document.document_search_service.dto.*;
 import com.distributed_document.document_search_service.exception.DocumentNotFoundException;
 import com.distributed_document.document_search_service.model.Document;
+import com.distributed_document.document_search_service.model.DocumentIndex;
 import com.distributed_document.document_search_service.repository.DocumentRepository;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
@@ -18,11 +19,21 @@ import org.springframework.transaction.annotation.Transactional;
 import java.util.List;
 
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class DocumentService {
 
     private final DocumentRepository documentRepository;
+    private final ElasticsearchService elasticsearchService;
+
+    @Autowired
+    public DocumentService(DocumentRepository documentRepository,
+                           @Autowired(required = false) ElasticsearchService elasticsearchService) {
+        this.documentRepository = documentRepository;
+        this.elasticsearchService = elasticsearchService;
+        if (elasticsearchService == null) {
+            log.info("Elasticsearch is disabled. Using MySQL full-text search.");
+        }
+    }
 
     @Transactional
     @CacheEvict(value = "searches", allEntries = true)
@@ -41,6 +52,12 @@ public class DocumentService {
 
         Document saved = documentRepository.save(document);
         log.info("Document created with id: {} for tenant: {}", saved.getId(), tenantId);
+
+        // Index in Elasticsearch (async-safe, won't fail the request)
+        if (elasticsearchService != null) {
+            elasticsearchService.indexDocument(saved);
+        }
+
         return DocumentResponse.fromEntity(saved);
     }
 
@@ -67,6 +84,12 @@ public class DocumentService {
 
         document.setStatus(Document.DocumentStatus.DELETED);
         documentRepository.save(document);
+
+        // Remove from Elasticsearch index
+        if (elasticsearchService != null) {
+            elasticsearchService.deleteDocument(documentId);
+        }
+
         log.info("Document soft-deleted: {}", documentId);
     }
 
@@ -78,31 +101,61 @@ public class DocumentService {
         long startTime = System.currentTimeMillis();
         Pageable pageable = PageRequest.of(page, size);
 
-        Page<Document> results;
+        List<DocumentResponse> documentResponses;
+        long totalResults;
+
+        // Try Elasticsearch first, fall back to MySQL
         try {
-            results = documentRepository.fullTextSearch(tenantId, query, pageable);
+            if (elasticsearchService == null) throw new RuntimeException("ES disabled");
+            Page<DocumentIndex> esResults = elasticsearchService.search(tenantId, query, pageable);
+            documentResponses = esResults.getContent().stream()
+                    .map(this::toResponse)
+                    .toList();
+            totalResults = esResults.getTotalElements();
+            log.info("Search served from Elasticsearch");
         } catch (Exception e) {
-            log.warn("Full-text search failed, falling back to LIKE search: {}", e.getMessage());
-            results = documentRepository.searchByQuery(tenantId, query, pageable);
+            log.info("Using MySQL search (ES unavailable): {}", e.getMessage());
+            Page<Document> results;
+            try {
+                results = documentRepository.fullTextSearch(tenantId, query, pageable);
+            } catch (Exception ex) {
+                log.warn("MySQL full-text search failed, falling back to LIKE: {}", ex.getMessage());
+                results = documentRepository.searchByQuery(tenantId, query, pageable);
+            }
+            documentResponses = results.getContent().stream()
+                    .map(DocumentResponse::fromEntity)
+                    .toList();
+            totalResults = results.getTotalElements();
         }
 
         long queryTime = System.currentTimeMillis() - startTime;
 
-        List<DocumentResponse> documentResponses = results.getContent().stream()
-                .map(DocumentResponse::fromEntity)
-                .toList();
-
         SearchResponse response = SearchResponse.builder()
                 .results(documentResponses)
-                .totalResults(results.getTotalElements())
+                .totalResults(totalResults)
                 .page(page)
                 .size(size)
                 .queryTimeMs(queryTime)
                 .query(query)
                 .build();
 
-        log.info("Search completed in {}ms, found {} results", queryTime, results.getTotalElements());
+        log.info("Search completed in {}ms, found {} results", queryTime, totalResults);
         return response;
+    }
+
+    private DocumentResponse toResponse(DocumentIndex index) {
+        return DocumentResponse.builder()
+                .id(index.getId())
+                .tenantId(index.getTenantId())
+                .title(index.getTitle())
+                .content(index.getContent())
+                .author(index.getAuthor())
+                .metadata(index.getMetadata())
+                .tags(index.getTags() != null ? List.of(index.getTags()) : List.of())
+                .status(index.getStatus())
+                .createdAt(index.getCreatedAt())
+                .updatedAt(index.getUpdatedAt())
+                .build();
     }
 
     // Circuit breaker fallback methods
