@@ -1,5 +1,8 @@
 package com.distributed_document.document_search_service.config;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.Cache;
 import org.springframework.cache.annotation.CachingConfigurer;
@@ -28,7 +31,7 @@ public class RedisConfig implements CachingConfigurer {
                 .entryTtl(Duration.ofMinutes(5))
                 .serializeValuesWith(
                         RedisSerializationContext.SerializationPair
-                                .fromSerializer(new GenericJackson2JsonRedisSerializer())
+                                .fromSerializer(new GenericJackson2JsonRedisSerializer(redisObjectMapper()))
                 );
 
         Map<String, RedisCacheConfiguration> cacheConfigurations = new HashMap<>();
@@ -39,6 +42,15 @@ public class RedisConfig implements CachingConfigurer {
                 .cacheDefaults(defaultConfig)
                 .withInitialCacheConfigurations(cacheConfigurations)
                 .build();
+    }
+
+    private ObjectMapper redisObjectMapper() {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.registerModule(new JavaTimeModule());
+        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+        mapper.activateDefaultTyping(mapper.getPolymorphicTypeValidator(),
+                ObjectMapper.DefaultTyping.NON_FINAL);
+        return mapper;
     }
 
     @Override
